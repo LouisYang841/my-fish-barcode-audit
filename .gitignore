@@ -1,0 +1,10 @@
+# raw data & caches - never commit large files
+data/raw/
+db/
+output/
+*.sqlite3
+*.db
+__pycache__/
+*.pyc
+.DS_Store
+tmp/
