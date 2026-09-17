@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
-"""03_load_midorii.py — MIDORI2 (curated GenBank) -> sqlite
+"""03_load_midorii.py — MIDORI2 vGB273 (curated GenBank) -> sqlite
 
-MIDORI2 vGB273 (Zenodo 10.5281/zenodo.22685700) — RAW zip unpacks per-gene FASTA.
-We keep: COI, srRNA (12S rRNA gene), lrRNA (16S rRNA gene).
-Headers look like: >COI|species binomial|...   (adjust parser to actual header on first run)
-
-Input:  data/raw/MIDORI2_GB273_RAW/   (unpacked)
-Output: sqlite db/coverage.db  table bold_genbank(seq_key UNIQUE, src_db, marker, species, length, country)
+Verified file layout (2026-09-18):
+  data/raw/MIDORI2_GB273_RAW/RAW/total/MIDORI2_TOTAL_NUC_GB273_{CO1,lrRNA,srRNA}_RAW.fasta.gz
+Header format:  >LC098275.1.<1.>604 root_1;...;family_Gobionidae_2743714;genus_Pseudorasbora_38758;species_Pseudorasbora parva_51549
+  - first token = accession (+ coords), species name in the `species_..._<taxid>` segment
+  - we keep only fish-lineage rows (class whitelist) to keep sqlite small
+  - country is not present in MIDORI2 -> NULL (local-origin analysis uses BOLD + GenBank efetch)
 """
+import gzip
 import re
 import sqlite3
 from pathlib import Path
 
 DB = Path(__file__).resolve().parents[1] / "db" / "coverage.db"
-RAW = Path(__file__).resolve().parents[1] / "data" / "raw" / "MIDORI2_GB273_RAW"
-MARKER_FILES = {
-    "COI": ["*COI*", "*cox1*"],
-    "12S": ["*srRNA*", "*12S*"],
-    "16S": ["*lrRNA*", "*16S*"],
+RAW = Path(__file__).resolve().parents[1] / "data" / "raw"
+FILES = {
+    "COI": RAW / "MIDORI2_GB273_RAW/RAW/total/MIDORI2_TOTAL_NUC_GB273_CO1_RAW.fasta.gz",
+    "12S": RAW / "MIDORI2_GB273_RAW/RAW/total/MIDORI2_TOTAL_NUC_GB273_srRNA_RAW.fasta.gz",
+    "16S": RAW / "MIDORI2_GB273_RAW/RAW/total/MIDORI2_TOTAL_NUC_GB273_lrRNA_RAW.fasta.gz",
 }
-MIN_LEN = {"COI": 500, "12S": 300, "16S": 300}  # frozen thresholds
+FISH_LINEAGE = re.compile(
+    r"class_(Actinopteri|Actinopterygii|Teleostei|Elasmobranchii|Holocephali|Cladistia|Chondrostei|Dipnoi)_"
+    r"|superclass_(Actinopterygii|Chondrichthyes|Sarcopterygii)_"
+    r"|subclass_Dipnoi_"
+)
+SPECIES_SEG = re.compile(r"species_(.+?)_(\d+)(?:;|$)")
+ACC = re.compile(r"^>([A-Za-z0-9_.]+)")
+BATCH = 200_000
 
 
 def ensure_db() -> sqlite3.Connection:
@@ -30,43 +38,62 @@ def ensure_db() -> sqlite3.Connection:
                seq_key TEXT PRIMARY KEY, src_db TEXT, marker TEXT,
                species TEXT, length INTEGER, country TEXT)"""
     )
-    con.execute("CREATE INDEX IF NOT EXISTS idx_seq_marker ON sequences(marker, src_db)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_seq_sp ON sequences(species, marker)")
     return con
 
 
-def parse_fasta(path: Path, marker: str, con: sqlite3.Connection) -> int:
+def parse_file(path: Path, marker: str, con: sqlite3.Connection) -> int:
     n = 0
+    batch = []
     name, seq = None, []
+
     def flush():
         nonlocal n
-        if name and seq:
-            s = "".join(seq).replace("-", "").upper()
-            if len(s) >= MIN_LEN[marker]:
-                m = re.match(r"^>?([A-Za-z0-9_.\-]+)\|([^|]+)\|", name)
-                sp = m.group(2).strip() if m else name[1:].split("|")[0].strip()
-                con.execute(
-                    "INSERT OR IGNORE INTO sequences VALUES(?,?,?,?,?,?)",
-                    (f"midorii:{name[1:].split('|')[0]}", "MIDORI2_GB273", marker, sp, len(s), None),
-                )
-                n += 1
-    for line in path.open(encoding="utf-8"):
-        line = line.strip()
-        if line.startswith(">"):
-            flush(); name, seq = line, []
-        elif line:
-            seq.append(line)
-    flush()
+        if name is None or not seq:
+            return
+        header, s = name, "".join(seq).replace("-", "").upper()
+        acc = ACC.match(header).group(1) if ACC.match(header) else header[1:30]
+        sp = ""
+        tail = header.split(" ", 1)
+        if len(tail) > 1:
+            for seg in reversed(tail[1].split(";")):
+                if seg.startswith("species_"):
+                    sp = SPECIES_SEG.match(seg).group(1) if SPECIES_SEG.match(seg) else ""
+                    break
+        if sp:
+            batch.append((f"midorii:{acc}:{marker}", "MIDORI2_GB273", marker, sp, len(s), None))
+            n += 1
+            if len(batch) >= BATCH:
+                con.executemany("INSERT OR IGNORE INTO sequences VALUES(?,?,?,?,?,?)", batch)
+                con.commit()
+                batch.clear()
+
+    with gzip.open(path, "rt", errors="ignore") as f:
+        keep = False
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                flush()
+                name, seq = line, []
+                keep = FISH_LINEAGE.search(name) is not None
+                continue
+            if name is not None and keep:
+                seq.append(line)
+        flush()
+    if batch:
+        con.executemany("INSERT OR IGNORE INTO sequences VALUES(?,?,?,?,?,?)", batch)
+        con.commit()
     return n
 
 
 def main() -> None:
     con = ensure_db()
-    for marker, patterns in MARKER_FILES.items():
-        files = [p for pat in patterns for p in RAW.rglob(pat)]
-        for p in files:
-            k = parse_fasta(p, marker, con)
-            print(f"{p.name}: {k} rows (>= {MIN_LEN[marker]} bp)")
-    con.commit()
+    for marker, path in FILES.items():
+        if not path.exists():
+            print(f"[skip] {path} missing")
+            continue
+        n = parse_file(path, marker, con)
+        print(f"{marker}: {n} fish rows loaded from {path.name}")
     print("done")
 
 

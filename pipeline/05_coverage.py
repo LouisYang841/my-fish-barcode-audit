@@ -25,34 +25,39 @@ def sciname_key(s: str) -> str:
     return " ".join(s.strip().split()).lower()
 
 
-def load_species() -> dict[str, str]:
-    out = {}
+def load_species() -> set[str]:
+    """Frozen list matched by BOTH raw names and GBIF accepted names (synonym collapse)."""
+    wanted: set[str] = set()
     with NAMES.open(encoding="utf-8", newline="") as f:
         for r in csv.DictReader(f):
-            out[sciname_key(r["species"])] = r["acc_name"] or r["species"]
-    return out
+            wanted.add(sciname_key(r["species"]))
+            if r.get("acc_name"):
+                wanted.add(sciname_key(r["acc_name"]))
+    return wanted
 
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB)
-    species_map = load_species()
-    wanted = set(species_map)  # accepted-name keys of the frozen list
+    wanted = load_species()  # synonym-collapsed accepted-name keys
+    # NOTE: N is len(load_species()) raw list; denominators below use the raw N
+    # (one row per frozen species), not the collapsed set size.
+    with NAMES.open(encoding="utf-8", newline="") as f:
+        N_FROZEN = sum(1 for _ in csv.DictReader(f))
 
     # build per-(marker, src_db, species_key) sequence counts
     counts: dict[tuple, int] = {}
     countries: dict[tuple, list[str]] = {}
-    for marker, ml in MIN_LEN.items():
-        for sp, length, country, src in con.execute(
-                "SELECT species, length, country, src_db FROM sequences WHERE marker LIKE ?", (marker + "%",)):
-            if length < ml:
-                continue
-            k = sciname_key(sp)
-            if k not in wanted:
-                continue
-            counts[(marker, src, k)] = counts.get((marker, src, k), 0) + 1
-            if country:
-                countries.setdefault((marker, k), []).append(country)
+    for marker, src, sp, length, country in con.execute(
+            "SELECT marker, src_db, species, length, country FROM sequences"):
+        if marker not in MIN_LEN or length < MIN_LEN[marker]:
+            continue
+        k = sciname_key(sp)
+        if k not in wanted:
+            continue
+        counts[(marker, src, k)] = counts.get((marker, src, k), 0) + 1
+        if country:
+            countries.setdefault((marker, k), []).append(country)
 
     libs = ["MIDORI2_GB273", "BOLD_public", "BOTH"]
     rows = []
@@ -63,20 +68,20 @@ def main() -> None:
             robust = {k for (m, s, k), c in counts.items()
                       if m == marker and (s == lib or (lib == "BOTH" and s in ("MIDORI2_GB273", "BOLD_public"))) and c >= ROBUST}
             rows.append({"marker": marker, "library": lib, "covered": len(have),
-                         "robust": len(robust), "N": len(wanted),
-                         "coverage_pct": round(100 * len(have) / len(wanted), 2),
-                         "robust_pct": round(100 * len(robust) / len(wanted), 2)})
+                         "robust": len(robust), "N": N_FROZEN,
+                         "coverage_pct": round(100 * len(have) / N_FROZEN, 2),
+                         "robust_pct": round(100 * len(robust) / N_FROZEN, 2)})
     with (OUT / "coverage.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
 
-    # Fisher's exact (Threatened vs LC) on COI coverage, both libraries combined
-    # IUCN status comes from species_names.csv column `status_raw` if present, else TODO rfishbase
-    # (kept explicit so the test is never run on an unstated denominator)
-    print("coverage.csv written. Fisher test requires IUCN column - run after 02 output carries it.")
+    # Fisher's exact (Threatened vs LC) needs the IUCN column - added at 02 output
+    # extension (D5). Kept explicit so the test is never run on an unstated denominator.
+    print(f"N frozen = {N_FROZEN}")
     for r in rows:
         print(r)
+    print("->", OUT / "coverage.csv")
 
 
 if __name__ == "__main__":
